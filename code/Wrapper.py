@@ -1,48 +1,56 @@
+from re import S
 import cv2
 import numpy as np
 import os
+from scipy.optimize import least_squares
+import glob
+from utils import estimateHomographies
 
 def get_homographies(camera_cal_imgs_path):
-    imgs_names = os.listdir(camera_cal_imgs_path)
-    cv2.namedWindow('img',cv2.WINDOW_NORMAL)
-    cv2.namedWindow('warped',cv2.WINDOW_NORMAL)
+    # imgs_names = os.listdir(camera_cal_imgs_path)
+    # cv2.namedWindow('img',cv2.WINDOW_NORMAL)
+    # cv2.namedWindow('warped',cv2.WINDOW_NORMAL)
     
-    objpoints = []
+    # objpoints = []
     rows = 6
     columns = 9
-    for i in range(columns):
-            for j in range(rows):
-                objpoints.append([[i*100,j*100]])
-    objpoints = np.array(objpoints)
+    # for i in range(columns):
+    #         for j in range(rows):
+    #             objpoints.append([[i*21.5,j*21.5]])
+    # objpoints = np.array(objpoints)
+    x, y = np.meshgrid(range(9), range(6))
+    objpoints = np.hstack((x.reshape(54, 1), y.reshape(
+        54, 1))).astype(np.float32)
+    objpoints = objpoints*21.5
+    objpoints = np.asarray(objpoints)
 
     imgpoints = []
     homographies = []
-    for name in imgs_names:
-        # print('loading image')
-        im_pt = []
-        img_path = os.path.join(camera_cal_imgs_path,name)
-        img = cv2.imread(img_path)
-        
-        ret,corners = cv2.findChessboardCorners(img,(rows,columns))
-        
-       
-        for corner in corners:
-            cv2.circle(img,(int(corner[0,0]),int(corner[0,1])),5,(0,0,255),-1)
-            # imgpoints.append([[int(corner[0,0]),int(corner[0,1])]])
-            im_pt.append([[int(corner[0,0]),int(corner[0,1])]])
-        imgpoints.extend(im_pt)
-        im_pt = np.array(im_pt)
-        # print(np.shape(objpoints))
-        # print(np.shape(im_pt))
+    imgs_names = sorted(glob.glob('./../data/Calibration_Imgs/*.jpg'))
 
-        H,mask = cv2.findHomography(im_pt,objpoints)
+    for name in imgs_names:
+
+        im_pt = []
+        img = cv2.imread(name)
+        
+        ret,corners = cv2.findChessboardCorners(img,(columns,rows))
+        
+        for corner in corners:
+            im_pt.append([[corner[0,0],corner[0,1]]])
+
+        corners = corners.reshape(-1,2)
+        imgpoints.append(corners)
+        im_pt = np.array(im_pt)
+
+
+        H,mask = cv2.findHomography(objpoints,corners)
         homographies.append(H)
     imgpoints = np.array(imgpoints)
 
     return homographies, imgpoints, objpoints
 
 def v_ij(H,i,j):
-    v = [H[0,i] * H[0,j], H[0,0] * H[1,j] + H[1,i] * H[0,j], H[1,i] * H[1,j],\
+    v = [H[0,i] * H[0,j], H[0,i] * H[1,j] + H[1,i] * H[0,j], H[1,i] * H[1,j],\
             H[2,i] * H[0,j] + H[0,i] * H[2,j], H[2,i] * H[1,j] + H[1,i] * H[2,j], H[2,i] * H[2,j]]
     return v
 
@@ -65,11 +73,12 @@ def get_intrinsic_matrix(V):
     B_13 = B[3]
     B_23 = B[4]
     B_33 = B[5]
+ 
     v0 = (B_12* B_13 - B_11*B_23)/(B_11*B_22 - B_12**2)
     lamda = B_33 - (B_13**2 + v0*(B_12*B_13 - B_11*B_23))/B_11
     alpha = np.sqrt(lamda/B_11)
     beta = np.sqrt(lamda*B_11/(B_11*B_22 - B_12**2))
-    gamma = B_12*(alpha**2)*beta/lamda
+    gamma = -1*B_12*(alpha**2)*beta/lamda
     u0 = gamma*v0/beta - (B_13*alpha**2)/lamda
     K = np.array([[alpha, gamma, u0],[0, beta, v0],[0, 0, 1]])
     return K
@@ -84,19 +93,81 @@ def get_extrinsic_matrix(H, K):
     E = np.array([r1,r2,r3,t])
     return E.T
 
+def error_func(params, objpoints, imgpoints, homographies):
+    # print(params)
+    K = np.array([[params[0], params[4], params[2]],[0, params[1], params[3]],[0, 0, 1]])
+    k1 = params[5]
+    k2 = params[6]
+    u0 = params[2]
+    v0 = params[3]
+
+    error = []
+    # objpoints = np.hstack((objpoints[:,:,0], objpoints[:,:,1], np.zeros((54,1)), np.ones((54,1))))
+
+    for img_points, homography in zip(imgpoints, homographies):
+        # print("loop: ", np.shape(img_points), np.shape(homography))
+        E = get_extrinsic_matrix(homography, K)
+
+        for im_pt, obj_pt in zip(img_points, objpoints):
+            u_actual = im_pt[0]
+            v_actual = im_pt[1]
+            obj_pt_hom = np.array([[obj_pt[0]],[obj_pt[1]], [0], [1]])
+            cam_points = np.dot(E,obj_pt_hom)
+            cam_points = cam_points/cam_points[2]
+            x, y = cam_points[0], cam_points[1]
+
+            img_coord = np.dot(K, cam_points)
+            img_coord = img_coord/img_coord[2]
+            u, v = img_coord[0], img_coord[1]
+
+            sq_term = x**2 + y**2
+            u_ideal = u + (u-u0)*((k1*sq_term) + k2*sq_term**2)
+            v_ideal = v + (v-v0)*((k1*sq_term) + k2*sq_term**2)
+
+            error.append(u_actual - u_ideal)
+            error.append(v_actual - v_ideal)
+    error =np.float64(error).flatten()
+    return error
+
+
+
+def optimize(K, objpoints, imgpoints, homographies):
+    k1 = 0
+    k2 = 0
+    params = [K[0,0], K[1,1],K[0,2],K[1,2],K[0,1],k1,k2]
+    optimized_params = least_squares(fun=error_func, x0 = params, method='lm', args=[objpoints,imgpoints,homographies])
+    [alpha, beta, u0, v0, gamma, k1, k2] = optimized_params.x
+    K = np.zeros((3,3))
+    K[0,0] = alpha
+    K[0,1] = gamma
+    K[0,2] = u0
+    K[1,1] = beta
+    K[1,2] = v0
+    K[2,2] = 1
+    return K, k1, k2
+
 def main(camera_cal_imgs_path):
 
     homographies, imgpoints, objpoints = get_homographies(camera_cal_imgs_path)
-    print('imgpoints shape:', imgpoints.shape)
-    print('objpoints shape:', objpoints.shape)
-    exit()
+
+    
     v_matrix = get_v_matrix(homographies)
-    # print(np.shape(v_matrix))
+
     V = np.array(v_matrix)
     K = get_intrinsic_matrix(V)
-    H_test = homographies[0]
-    E = get_extrinsic_matrix(H_test, K)
-    print(E.shape)
+    print("K initial:\n", K)
+
+    # for img_point, homography in zip(imgpoints,homographies):
+    #     ext = get_extrinsic_matrix(homography, K)
+    #     E.append(ext)
+    # print("E0:\n",E[0])
+    # params = [K[0,0],K[1,1],K[0,2],K[1,2],K[0,1], 0, 0]
+    # e = error_func(params, objpoints, imgpoints, homographies)
+
+    K_final, k1, k2 = optimize(K, objpoints, imgpoints, homographies)
+    print("final K:",K_final)
+    print("k1, k2:",k1,k2)
+
 
 
 if __name__=="__main__":
